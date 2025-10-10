@@ -1,0 +1,20 @@
+# --- Componentes Comuns ---
+python-dotenv
+
+# --- RAG (Recuperação de Informação e LLM) ---
+langchain
+langchain-community
+langchain-openai
+tiktoken    # Para contagem de tokens
+faiss-cpu   # Para o armazenamento vetorial local
+pypdf       # Para ler documentos PDF
+
+# --- Framework Web e Servidor (Scheduler API) ---
+fastapi
+uvicorn
+
+# --- Integração com Serviços (Scheduler API) ---
+supabase
+google-auth
+google-auth-oauthlib
+google-api-python-client

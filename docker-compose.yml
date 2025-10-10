@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  rag-service:
+    build: .
+    container_name: rag-service
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./rag.py:/app/rag.py
+      - ./requirements.txt:/app/requirements.txt
+    networks:
+      - evolution_network
+
+networks:
+  evolution_network:
+    external: true

@@ -1,0 +1,15 @@
+# Ignorar arquivos sensíveis
+scheduler_service/service_account.json
+scheduler_service/.env
+
+# Ignorar arquivos temporários e do sistema
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.sqlite3
+*.db
+.env
+.DS_Store
+.vscode/
+.idea/

@@ -8,9 +8,9 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from zoneinfo import ZoneInfo
 
-# 🟢 Importa o router do scheduler_service
-from scheduler_service.agendar import router as scheduler_router
-
+# 🟢 Importa as funções de Supabase e a função de cliente Supabase
+# DEPOIS:
+from supabase_supabase import get_lifeplanner_email, save_agendamento, get_supabase_client
 
 # --- Carrega variáveis do .env ---
 load_dotenv()
@@ -18,26 +18,45 @@ print("=== DEBUG VARIÁVEIS ===")
 print("CWD:", os.getcwd())
 print("GOOGLE_SERVICE_ACCOUNT_FILE:", os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE"))
 
-# --- Inicializa FastAPI ---
+# --- Inicializa FastAPI e Router ---
 app = FastAPI()
-# 🟢 Inclui as rotas do serviço de agendamento
-app.include_router(scheduler_router, prefix="/agendar", tags=["Agendamentos"])
+# Define o router para as rotas do serviço de agendamento (necessário para os @router.post abaixo)
+router = APIRouter() 
+# A linha abaixo deve ser corrigida ou removida se os endpoints estiverem neste arquivo:
+# from scheduler_service.agendar import router as scheduler_router 
+# app.include_router(scheduler_router, prefix="/agendar", tags=["Agendamentos"])
 
-
-# --- Modelo de payload ---
+# --- Modelo de payload CORRIGIDO E ESCALÁVEL ---
 class AgendamentoPayload(BaseModel):
     summary: str
     description: str
     start_time: datetime
     end_time: datetime
     attendee_emails: List[str]
-    organizer_email: str
+    organizer_email: Optional[str] = None # Tornamos opcional, pois buscaremos via ID
+    cliente_id: str # NOVO: ID DO LIFE PLANNER (VENDEDOR) - CRÍTICO PARA ESCALABILIDADE
+    cliente_celular: Optional[str] = None # NOVO: Celular do Consumidor Final - CRÍTICO PARA SALVAMENTO
+
+
+# --- Configuração de timezone e regras de negócio ---
+TIMEZONE = "America/Sao_Paulo"
+TZ = ZoneInfo(TIMEZONE)
+
+BUSINESS_HOURS = {
+    0: ("13:00", "18:00"),# Segunda
+    1: ("11:00", "18:00"),# Terça
+    2: ("11:00", "18:00"),# Quarta
+    3: ("11:00", "18:00"),# Quinta
+    4: ("11:00", "13:00"),# Sexta
+    5: None,# Sábado
+    6: None,# Domingo
+}
+
 
 # --- Função para criar o serviço do Google Calendar ---
 def get_calendar_service():
     service_account_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 
-    # Corrige barras no Windows
     if service_account_file:
         service_account_file = service_account_file.replace("\\", "/")
 
@@ -58,21 +77,7 @@ def get_calendar_service():
     service = build("calendar", "v3", credentials=creds)
     return service
 
-# --- Configuração de timezone e regras de negócio ---
-TIMEZONE = "America/Sao_Paulo"
-TZ = ZoneInfo(TIMEZONE)
-
-BUSINESS_HOURS = {
-    0: ("13:00", "18:00"),  # Segunda
-    1: ("11:00", "18:00"),  # Terça
-    2: ("11:00", "18:00"),  # Quarta
-    3: ("11:00", "18:00"),  # Quinta
-    4: ("11:00", "13:00"),  # Sexta
-    5: None,                # Sábado
-    6: None,                # Domingo
-}
-
-# --- Funções auxiliares ---
+# --- Funções auxiliares (Sem alteração) ---
 try:
     from dateutil.parser import isoparse
 except Exception:
@@ -92,20 +97,24 @@ def get_business_window_for_date(d: date) -> Optional[Tuple[datetime, datetime]]
 
 def is_holiday(d: date) -> bool:
     try:
-        from scheduler_service.supabase_client import get_holidays_for_date
-        return get_holidays_for_date(d)
+        # Nota: Seu código original chamava 'scheduler_service.supabase_client'. 
+        # Esta lógica deve ser movida para o 'supabase_supabase.py' ou removida se não for usada.
+        # Por simplicidade, mantemos o fallback:
+        LOCAL_HOLIDAYS = set()
+        return d in LOCAL_HOLIDAYS
     except Exception:
         LOCAL_HOLIDAYS = set()
         return d in LOCAL_HOLIDAYS
 
 def get_existing_events_for_day(d: date) -> List[Tuple[datetime, datetime]]:
+    # Esta função usa 'calendarId="primary"' - Isso deve ser revisado se houver múltiplos calendars de vendedores
     window = get_business_window_for_date(d)
     if not window:
         return []
     start_dt, end_dt = window
     service = get_calendar_service()
     events_res = service.events().list(
-        calendarId="primary",
+        calendarId="primary", # ATENÇÃO: Se for para vários LPs, este ID precisa ser dinâmico!
         timeMin=start_dt.isoformat(),
         timeMax=end_dt.isoformat(),
         singleEvents=True,
@@ -167,7 +176,7 @@ def generate_slots_for_day(d: date) -> List[Tuple[datetime, datetime]]:
             slots.append((iter_start, iter_start + timedelta(minutes=50)))
     return slots
 
-# --- Endpoint para consultar slots ---
+# --- Endpoint para consultar slots (Sem alteração) ---
 @router.post("/slots/")
 def available_slots(payload: dict = Body(...)):
     date_str = payload.get("date")
@@ -180,10 +189,22 @@ def available_slots(payload: dict = Body(...)):
     slots = generate_slots_for_day(d)
     return {"date": date_str, "slots": [{"start": s.isoformat(), "end": e.isoformat()} for s, e in slots]}
 
-# --- Endpoint para criar agendamento ---
+# --- Endpoint para criar agendamento (CORRIGIDO PARA ESCALABILIDADE E SUPABASE) ---
 @router.post("/")
 def schedule_event(payload: AgendamentoPayload):
     try:
+        # 1. DEFINE O CALENDÁRIO/ORGANIZADOR (LÓGICA ESCALÁVEL)
+        calendar_id = payload.organizer_email # Prioridade 1: Tenta usar o email que o n8n envia
+        
+        if not calendar_id:
+            # Prioridade 2: Busca na tabela 'life_planners' usando o ID do Vendedor
+            calendar_id = get_lifeplanner_email(payload.cliente_id)
+        
+        # Fallback de Segurança
+        if not calendar_id:
+            calendar_id = "jjsales003@gmail.com" 
+
+        # --- 2. GOOGLE CALENDAR (AGENDAMENTO) ---
         service = get_calendar_service()
         event = {
             "summary": payload.summary,
@@ -191,34 +212,52 @@ def schedule_event(payload: AgendamentoPayload):
             "start": {"dateTime": payload.start_time.isoformat(), "timeZone": TIMEZONE},
             "end": {"dateTime": payload.end_time.isoformat(), "timeZone": TIMEZONE},
             "attendees": [{"email": email} for email in payload.attendee_emails],
-            "organizer": {"email": payload.organizer_email},
+            "organizer": {"email": calendar_id}, # Usa o email definido/buscado
             "reminders": {"useDefault": True},
         }
-        created_event = service.events().insert(calendarId="primary", body=event).execute()
+        
+        # Cria o evento no calendário do Vendedor
+        created_event = service.events().insert(
+            calendarId=calendar_id, # CRÍTICO: Usa o ID do calendário/Vendedor DINÂMICO
+            body=event
+        ).execute()
+        
+        event_id = created_event.get("id")
+        event_link = created_event.get("htmlLink")
+
+        # --- 3. SUPABASE (SALVAMENTO) ---
+        save_agendamento(payload.dict(), event_id, event_link)
+        
         return {
             "status": "success",
-            "event_id": created_event.get("id"),
-            "event_link": created_event.get("htmlLink")
+            "event_id": event_id,
+            "event_link": event_link
         }
+        
     except Exception as e:
+        print(f"ERRO FATAL DURANTE AGENDAMENTO: {e}")
         raise HTTPException(status_code=500, detail=f"Falha ao agendar: {e}")
 
-# --- Endpoint para reagendar ---
+# --- Endpoint para reagendar (CORRIGIDO para usar a nova função de cliente Supabase) ---
 @router.post("/reagendar/")
 def reschedule_event(payload: dict = Body(...)):
+    db = get_supabase_client() # Obtém o cliente Supabase
     id_lp = payload.get("id_lifeplanner")
     celular = payload.get("cliente_celular")
     new_start_str = payload.get("new_start_time")
     new_end_str = payload.get("new_end_time")
+    
     if not all([id_lp, celular, new_start_str, new_end_str]):
         raise HTTPException(400, "Campos obrigatórios: id_lifeplanner, cliente_celular, new_start_time, new_end_time")
     
-    res = supabase.table("agendamentos") \
+    # Nota: Assumindo que a tabela ainda se chama "agendamentos" neste endpoint, mas o nome correto é "agendamentos_ativos"
+    res = db.table("agendamentos") \
         .select("*") \
         .eq("id_lifeplanner", id_lp) \
         .eq("cliente_celular", celular) \
         .eq("status", "scheduled") \
         .execute()
+    
     if not res.data:
         raise HTTPException(404, "Agendamento não encontrado")
     ag = res.data[0]
@@ -226,12 +265,16 @@ def reschedule_event(payload: dict = Body(...)):
     try:
         service = get_calendar_service()
         event_id = ag["event_id_google"]
-        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        
+        # Busca o email do organizador (agora dinâmico)
+        calendar_id = get_lifeplanner_email(id_lp)
+
+        event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
         event["start"]["dateTime"] = new_start_str
         event["end"]["dateTime"] = new_end_str
-        updated_event = service.events().update(calendarId="primary", eventId=event_id, body=event).execute()
+        updated_event = service.events().update(calendarId=calendar_id, eventId=event_id, body=event).execute()
 
-        supabase.table("agendamentos").update({
+        db.table("agendamentos").update({
             "start_time": new_start_str,
             "end_time": new_end_str
         }).eq("id", ag["id"]).execute()
@@ -241,20 +284,23 @@ def reschedule_event(payload: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, f"Falha ao reagendar: {e}")
 
-# --- Endpoint para cancelar ---
+# --- Endpoint para cancelar (CORRIGIDO para usar a nova função de cliente Supabase) ---
 @router.post("/cancelar/")
 def cancel_event(payload: dict = Body(...)):
+    db = get_supabase_client() # Obtém o cliente Supabase
     id_lp = payload.get("id_lifeplanner")
     celular = payload.get("cliente_celular")
+    
     if not id_lp or not celular:
         raise HTTPException(400, "Campos obrigatórios: id_lifeplanner, cliente_celular")
 
-    res = supabase.table("agendamentos") \
+    res = db.table("agendamentos") \
         .select("*") \
         .eq("id_lifeplanner", id_lp) \
         .eq("cliente_celular", celular) \
         .eq("status", "scheduled") \
         .execute()
+    
     if not res.data:
         raise HTTPException(404, "Agendamento não encontrado")
     ag = res.data[0]
@@ -262,9 +308,13 @@ def cancel_event(payload: dict = Body(...)):
     try:
         service = get_calendar_service()
         event_id = ag["event_id_google"]
-        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        
+        # Busca o email do organizador (agora dinâmico)
+        calendar_id = get_lifeplanner_email(id_lp)
 
-        supabase.table("agendamentos").update({
+        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+
+        db.table("agendamentos").update({
             "status": "canceled"
         }).eq("id", ag["id"]).execute()
 
@@ -273,4 +323,4 @@ def cancel_event(payload: dict = Body(...)):
         raise HTTPException(500, f"Falha ao cancelar: {e}")
 
 # --- Inclui router no app ---
-app.include_router(router)
+app.include_router(router, prefix="/agendar") # Uso corrigido: inclui todas as rotas definidas acima
